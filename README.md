@@ -96,12 +96,6 @@ ssh-keyscan -p 22 your.host | ssh-keygen -lf - | awk '{print $2}'
 
 Store the resulting `SHA256:...` value as the `fingerprint` secret.
 
-## Using from a private action repo
-
-This action is **private**. For other `slothiestudio` repos to consume it, enable it in
-this repo's **Settings → Actions → General → Access →
-"Accessible from repositories in the slothiestudio organization"**.
-
 ## Versioning
 
 Reference a major tag (`@v1`) for automatic minor/patch updates, or pin an exact tag
