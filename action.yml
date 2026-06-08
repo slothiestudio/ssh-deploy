@@ -1,0 +1,214 @@
+name: "rsync SSH deploy"
+description: >
+  Deploy a built site to a server over SSH using rsync. Supports SSH key or password
+  auth, encrypted keys (passphrase), pinned host-key fingerprint verification, and a
+  post-deploy script.
+
+branding:
+  icon: "upload-cloud"
+  color: "blue"
+
+inputs:
+  host:
+    description: "SSH host / server address."
+    required: true
+  port:
+    description: "SSH port."
+    required: false
+    default: "22"
+  username:
+    description: "SSH username."
+    required: true
+  ssh-private-key:
+    description: "Private SSH key (PEM). Preferred auth. Store as a repository secret."
+    required: false
+    default: ""
+  passphrase:
+    description: "Passphrase for an encrypted private key. Loaded via ssh-agent."
+    required: false
+    default: ""
+  password:
+    description: "SSH password. Used only when no ssh-private-key is given (via sshpass)."
+    required: false
+    default: ""
+  fingerprint:
+    description: >
+      Expected server host-key fingerprint (e.g. 'SHA256:abc...'). When set, the host is
+      verified against it before connecting (MITM-safe). When empty, the host key is
+      trusted on first use (TOFU).
+    required: false
+    default: ""
+  timeout:
+    description: "SSH connection timeout in seconds."
+    required: false
+    default: "30"
+  source:
+    description: "Local directory to deploy (trailing slash means 'contents of')."
+    required: false
+    default: "./"
+  target:
+    description: "Absolute path to the deploy directory on the server."
+    required: true
+  delete:
+    description: "Pass --delete so files removed locally are also removed on the server."
+    required: false
+    default: "true"
+  exclude:
+    description: >
+      Generic rsync exclude patterns applied to every deploy (VCS, editor and OS noise,
+      dependencies). Newline-separated; lines starting with '#' are comments; a leading
+      '/' anchors to the deploy root. Override only to change these generic defaults.
+    required: false
+    default: |
+      # VCS
+      /.git
+      /.github
+      .git*
+      # Dependencies (installed/built in CI, but never the source trees)
+      node_modules
+      # Editor / tooling
+      .idea
+      .vscode
+      .claude
+      # OS noise
+      .DS_Store
+      Icon
+  extra-exclude:
+    description: >
+      Project-specific exclude patterns, merged with `exclude`. Put live data that must
+      not be pushed or deleted on the server (content, caches, sessions, licenses) and
+      project source/config here. Same format as `exclude`. Excluded paths are also
+      protected from --delete.
+    required: false
+    default: ""
+  post-deploy:
+    description: >
+      Optional command to run on the server over SSH after the sync (e.g. clear the
+      cache). Runs with 'set -e', so a failed command fails the job.
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure host verification and auth
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        PORT: ${{ inputs.port }}
+        SSH_KEY: ${{ inputs.ssh-private-key }}
+        PASSPHRASE: ${{ inputs.passphrase }}
+        PASSWORD: ${{ inputs.password }}
+        FINGERPRINT: ${{ inputs.fingerprint }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+
+        # --- Host key verification ---
+        scan="$(ssh-keyscan -p "$PORT" "$HOST" 2>/dev/null || true)"
+        if [ -z "$scan" ]; then
+          echo "::error::ssh-keyscan returned no host keys for $HOST:$PORT"; exit 1
+        fi
+        if [ -n "$FINGERPRINT" ]; then
+          match=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            fp="$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+            [ "$fp" = "$FINGERPRINT" ] && match="yes"
+          done <<< "$scan"
+          if [ -z "$match" ]; then
+            echo "::error::Host key for $HOST did not match the pinned fingerprint."; exit 1
+          fi
+          echo "Host key verified against pinned fingerprint."
+        else
+          echo "::warning::No fingerprint provided; trusting host key on first use (TOFU)."
+        fi
+        printf '%s\n' "$scan" >> ~/.ssh/known_hosts
+        chmod 600 ~/.ssh/known_hosts
+
+        SSH_OPTS="-p $PORT -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=$TIMEOUT"
+
+        # --- Authentication ---
+        if [ -n "$SSH_KEY" ]; then
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)"
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+            askpass="$(mktemp)"
+            printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$DEPLOY_KEY_PASSPHRASE"\n' > "$askpass"
+            chmod 700 "$askpass"
+            DEPLOY_KEY_PASSPHRASE="$PASSPHRASE" SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force \
+              ssh-add ~/.ssh/deploy_key < /dev/null
+            rm -f "$askpass"
+            RSYNC_RSH="ssh $SSH_OPTS"
+          else
+            RSYNC_RSH="ssh $SSH_OPTS -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes"
+          fi
+        elif [ -n "$PASSWORD" ]; then
+          command -v sshpass >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq sshpass; }
+          echo "SSHPASS=$PASSWORD" >> "$GITHUB_ENV"
+          RSYNC_RSH="sshpass -e ssh $SSH_OPTS -o PubkeyAuthentication=no"
+        else
+          echo "::error::Provide either ssh-private-key or password."; exit 1
+        fi
+        echo "RSYNC_RSH=$RSYNC_RSH" >> "$GITHUB_ENV"
+
+    - name: Build rsync exclude args
+      id: excludes
+      shell: bash
+      env:
+        EXCLUDE: ${{ inputs.exclude }}
+        EXTRA_EXCLUDE: ${{ inputs.extra-exclude }}
+      run: |
+        args=""
+        while IFS= read -r pattern; do
+          # trim surrounding whitespace
+          pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+          pattern="${pattern%"${pattern##*[![:space:]]}"}"
+          # skip blank lines and comments
+          [ -z "$pattern" ] && continue
+          case "$pattern" in \#*) continue ;; esac
+          args="$args --exclude=$pattern"
+        done <<< "$EXCLUDE
+        $EXTRA_EXCLUDE"
+        echo "args=$args" >> "$GITHUB_OUTPUT"
+
+    - name: Sync files
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        USERNAME: ${{ inputs.username }}
+        HOST: ${{ inputs.host }}
+        TARGET: ${{ inputs.target }}
+        DELETE: ${{ inputs.delete }}
+        EXCLUDE_ARGS: ${{ steps.excludes.outputs.args }}
+      run: |
+        set -euo pipefail
+        DELETE_FLAG=""
+        [ "$DELETE" = "true" ] && DELETE_FLAG="--delete"
+        rsync --archive --compress --verbose --human-readable \
+          $DELETE_FLAG $EXCLUDE_ARGS \
+          -e "$RSYNC_RSH" \
+          "$SOURCE" \
+          "$USERNAME@$HOST:$TARGET"
+
+    - name: Run post-deploy command
+      if: ${{ inputs.post-deploy != '' }}
+      shell: bash
+      env:
+        USERNAME: ${{ inputs.username }}
+        HOST: ${{ inputs.host }}
+        POST_DEPLOY: ${{ inputs.post-deploy }}
+      run: |
+        set -euo pipefail
+        $RSYNC_RSH "$USERNAME@$HOST" "set -e; $POST_DEPLOY"
+
+    - name: Clean up
+      if: always()
+      shell: bash
+      run: |
+        rm -f ~/.ssh/deploy_key
+        if [ -n "${SSH_AGENT_PID:-}" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi
